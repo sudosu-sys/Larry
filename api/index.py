@@ -39,10 +39,15 @@ async def fetch_history(user_id: int):
     )
     await conn.close()
     
-    # Format for Gemini SDK
     history = []
     for row in rows:
-        history.append(types.Content(role=row['role'], parts=[types.Part.from_text(row['content'])]))
+        # Group consecutive messages of the same role to prevent Gemini API crashes
+        if not history or history[-1].role != row['role']:
+            # Fixed TypeError by explicitly declaring 'text='
+            history.append(types.Content(role=row['role'], parts=[types.Part.from_text(text=row['content'])]))
+        else:
+            history[-1].parts.append(types.Part.from_text(text=row['content']))
+            
     return history
 
 async def save_message(user_id: int, role: str, content: str):
@@ -59,26 +64,35 @@ async def handle_business_chat(update: Update, context: ContextTypes.DEFAULT_TYP
     if not biz_msg or not biz_msg.text:
         return
 
-    user_id = biz_msg.from_user.id
+    # Your Telegram ID based on the Neon DB dump
+    SUDO_ID = 7706888177
+    
+    # If you step in and manually reply, Larry ignores the message 
+    # so he doesn't talk to you or log your replies as user prompts.
+    if biz_msg.from_user.id == SUDO_ID:
+        return
+
+    # Group the memory by the Chat ID, not the sender's ID
+    chat_id = biz_msg.chat.id
     user_text = biz_msg.text
 
     # 1. Save incoming message
-    await save_message(user_id, 'user', user_text)
+    await save_message(chat_id, 'user', user_text)
 
     # 2. Rebuild memory from Neon
-    history = await fetch_history(user_id)
+    history = await fetch_history(chat_id)
 
     # 3. Generate response with context
     try:
         response = await ai_client.models.generate_content(
             model='gemini-2.5-flash',
-            contents=history, # Pass the entire history so Larry knows what he's said
+            contents=history,
             config=config
         )
         reply_text = response.text
         
         # 4. Save response to Neon and send
-        await save_message(user_id, 'model', reply_text)
+        await save_message(chat_id, 'model', reply_text)
         await biz_msg.reply_text(reply_text)
         
     except Exception as e:
