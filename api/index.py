@@ -6,15 +6,14 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, Request, Response
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
-from google import genai
-from google.genai import types
+from groq import AsyncGroq
 
 # --- CONFIGURATION ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")  # Your Neon connection string
 
-ai_client = genai.Client(api_key=GEMINI_KEY).aio
+ai_client = AsyncGroq(api_key=GROQ_API_KEY)
 
 SUDO_ID = 7706888177
 
@@ -57,32 +56,51 @@ SYSTEM_PROMPT = (
     "No emojis unless the vibe clearly calls for it. No corporate speak."
 )
 
-config = types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, temperature=0.85)
-
 # Initialize FastAPI and Telegram App
 app = FastAPI()
 ptb_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
 
+# --- GROQ HELPER ---
+
+async def groq_chat(messages: list, temperature: float = 0.85) -> str:
+    """Single reusable call to Groq. Messages must be in OpenAI format: [{role, content}]."""
+    response = await ai_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=messages,
+        temperature=temperature,
+        max_tokens=1024,
+    )
+    return response.choices[0].message.content.strip()
+
+
+def build_groq_history(db_rows: list) -> list:
+    """
+    Converts raw DB rows into Groq/OpenAI message format.
+    DB roles are 'user' and 'model' — Groq expects 'user' and 'assistant'.
+    """
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for role, content in db_rows:
+        groq_role = "assistant" if role == "model" else "user"
+        messages.append({"role": groq_role, "content": content})
+    return messages
+
+
 # --- DATABASE LOGIC ---
 
-async def fetch_history(chat_id: int):
+async def fetch_history(chat_id: int) -> list:
+    """Returns chat history as a Groq-formatted message list."""
     conn = await asyncpg.connect(DATABASE_URL)
     rows = await conn.fetch(
         "SELECT role, content FROM chat_history WHERE user_id = $1 ORDER BY created_at ASC LIMIT 20",
         chat_id
     )
     await conn.close()
-    history = []
-    for row in rows:
-        if not history or history[-1].role != row['role']:
-            history.append(types.Content(role=row['role'], parts=[types.Part.from_text(text=row['content'])]))
-        else:
-            history[-1].parts.append(types.Part.from_text(text=row['content']))
-    return history
+    return build_groq_history([(row['role'], row['content']) for row in rows])
 
 
 async def save_message(chat_id: int, role: str, content: str):
+    """Saves a message to DB. Always store role as 'user' or 'model'."""
     conn = await asyncpg.connect(DATABASE_URL)
     await conn.execute(
         "INSERT INTO chat_history (user_id, role, content) VALUES ($1, $2, $3)",
@@ -158,15 +176,11 @@ async def mark_sudo_replied(chat_id: int):
 
 def is_fresh_window(last_message_at, sudo_replied_since: bool) -> bool:
     """Returns True if the 3-message routine should run."""
-    # Sudo replied since last Larry interaction → always fresh
     if sudo_replied_since:
         return True
-    # No prior session → fresh
     if last_message_at is None:
         return True
-    # Time gap >= FRESH_WINDOW_HOURS → fresh
     now = datetime.now(timezone.utc)
-    # Make sure last_message_at is timezone-aware
     if last_message_at.tzinfo is None:
         last_message_at = last_message_at.replace(tzinfo=timezone.utc)
     hours_elapsed = (now - last_message_at).total_seconds() / 3600
@@ -175,23 +189,22 @@ def is_fresh_window(last_message_at, sudo_replied_since: bool) -> bool:
 
 # --- BOT LOGIC ---
 
-async def run_checkin_routine(biz_msg, history, user_text: str):
+async def run_checkin_routine(biz_msg, history: list, user_text: str):
     """
-    Sends the 3-message check-in routine, then generates a natural
-    follow-up reply that handles the actual content of the user's message.
+    Sends the 3-message check-in routine using Groq.
+    history is already in Groq format (with system prompt at index 0).
     """
     # --- MESSAGE 1: Sudo is a busy CTO ---
-    msg1_prompt = (
-        f"The user just sent: \"{user_text}\"\n\n"
-        "Send Message 1 of the check-in routine ONLY. "
-        "Set the tone — Sudo is a very busy CTO, no apologies, just facts. "
-        "1-2 sentences max. Do not include Message 2 or 3."
-    )
-    history_m1 = history + [types.Content(role='user', parts=[types.Part.from_text(text=msg1_prompt)])]
-    resp1 = await ai_client.models.generate_content(
-        model='gemini-2.5-flash', contents=history_m1, config=config
-    )
-    msg1_text = resp1.text.strip()
+    messages_m1 = history + [{
+        "role": "user",
+        "content": (
+            f"The user just sent: \"{user_text}\"\n\n"
+            "Send Message 1 of the check-in routine ONLY. "
+            "Set the tone — Sudo is a very busy CTO, no apologies, just facts. "
+            "1-2 sentences max. Do not include Message 2 or 3."
+        )
+    }]
+    msg1_text = await groq_chat(messages_m1)
     await biz_msg.reply_text(msg1_text)
     await save_message(biz_msg.chat.id, 'model', msg1_text)
 
@@ -199,26 +212,25 @@ async def run_checkin_routine(biz_msg, history, user_text: str):
     await asyncio.sleep(random.uniform(2.0, 3.0))
 
     # --- MESSAGE 2: Going to check on Sudo ---
-    msg2_prompt = (
-        "Send Message 2 of the check-in routine ONLY. "
-        "Tell them you are going to go check what Sudo is up to right now. "
-        "1 sentence. Casual but purposeful. Do not include Message 1 or 3."
-    )
-    history_m2 = history_m1 + [
-        types.Content(role='model', parts=[types.Part.from_text(text=msg1_text)]),
-        types.Content(role='user', parts=[types.Part.from_text(text=msg2_prompt)])
+    messages_m2 = messages_m1 + [
+        {"role": "assistant", "content": msg1_text},
+        {
+            "role": "user",
+            "content": (
+                "Send Message 2 of the check-in routine ONLY. "
+                "Tell them you are going to go check what Sudo is up to right now. "
+                "1 sentence. Casual but purposeful. Do not include Message 1 or 3."
+            )
+        }
     ]
-    resp2 = await ai_client.models.generate_content(
-        model='gemini-2.5-flash', contents=history_m2, config=config
-    )
-    msg2_text = resp2.text.strip()
+    msg2_text = await groq_chat(messages_m2)
     await biz_msg.reply_text(msg2_text)
     await save_message(biz_msg.chat.id, 'model', msg2_text)
 
-    # --- DELAY before message 3 (longer — simulates actually going to check) ---
+    # --- DELAY before message 3 ---
     await asyncio.sleep(random.uniform(3.0, 5.0))
 
-    # --- MESSAGE 3: Status report + handle the actual message ---
+    # --- MESSAGE 3: Status report ---
     status_scenarios = [
         "deep in a coding session and completely locked in",
         "in a meeting and cannot step away right now",
@@ -226,22 +238,21 @@ async def run_checkin_routine(biz_msg, history, user_text: str):
     ]
     chosen_status = random.choice(status_scenarios)
 
-    msg3_prompt = (
-        f"Send Message 3 of the check-in routine ONLY. "
-        f"You checked and Sudo is currently: {chosen_status}. "
-        f"Report this back naturally in 1-2 sentences. "
-        f"The user's original message was: \"{user_text}\". "
-        f"If it contains a request, confirm you have logged it for Sudo. "
-        f"Do not include Message 1 or 2."
-    )
-    history_m3 = history_m2 + [
-        types.Content(role='model', parts=[types.Part.from_text(text=msg2_text)]),
-        types.Content(role='user', parts=[types.Part.from_text(text=msg3_prompt)])
+    messages_m3 = messages_m2 + [
+        {"role": "assistant", "content": msg2_text},
+        {
+            "role": "user",
+            "content": (
+                f"Send Message 3 of the check-in routine ONLY. "
+                f"You checked and Sudo is currently: {chosen_status}. "
+                f"Report this back naturally in 1-2 sentences. "
+                f"The user's original message was: \"{user_text}\". "
+                f"If it contains a request, confirm you have logged it for Sudo. "
+                f"Do not include Message 1 or 2."
+            )
+        }
     ]
-    resp3 = await ai_client.models.generate_content(
-        model='gemini-2.5-flash', contents=history_m3, config=config
-    )
-    msg3_text = resp3.text.strip()
+    msg3_text = await groq_chat(messages_m3)
     await biz_msg.reply_text(msg3_text)
     await save_message(biz_msg.chat.id, 'model', msg3_text)
 
@@ -266,22 +277,16 @@ async def handle_business_chat(update: Update, context: ContextTypes.DEFAULT_TYP
     last_message_at, sudo_replied_since, larry_routine_ran_at = await get_session_state(chat_id)
     fresh = is_fresh_window(last_message_at, sudo_replied_since)
 
-    # Rebuild memory
+    # Rebuild memory in Groq format
     history = await fetch_history(chat_id)
 
     try:
         if fresh:
-            # Run the full 3-message check-in routine
             await run_checkin_routine(biz_msg, history, user_text)
             await update_session_after_larry(chat_id)
         else:
             # Same session — Larry just responds naturally
-            response = await ai_client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=history,
-                config=config
-            )
-            reply_text = response.text.strip()
+            reply_text = await groq_chat(history)
             await save_message(chat_id, 'model', reply_text)
             await biz_msg.reply_text(reply_text)
             await update_session_last_message(chat_id)
