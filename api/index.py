@@ -193,6 +193,7 @@ async def run_checkin_routine(biz_msg, history, user_text: str):
     )
     msg1_text = resp1.text.strip()
     await biz_msg.reply_text(msg1_text)
+    await save_message(biz_msg.chat.id, 'model', msg1_text)
 
     # --- DELAY before message 2 ---
     await asyncio.sleep(random.uniform(2.0, 3.0))
@@ -212,6 +213,7 @@ async def run_checkin_routine(biz_msg, history, user_text: str):
     )
     msg2_text = resp2.text.strip()
     await biz_msg.reply_text(msg2_text)
+    await save_message(biz_msg.chat.id, 'model', msg2_text)
 
     # --- DELAY before message 3 (longer — simulates actually going to check) ---
     await asyncio.sleep(random.uniform(3.0, 5.0))
@@ -241,10 +243,7 @@ async def run_checkin_routine(biz_msg, history, user_text: str):
     )
     msg3_text = resp3.text.strip()
     await biz_msg.reply_text(msg3_text)
-
-    # Save the full exchange to history as a single model turn
-    full_larry_response = f"{msg1_text}\n\n{msg2_text}\n\n{msg3_text}"
-    await save_message(biz_msg.chat.id, 'model', full_larry_response)
+    await save_message(biz_msg.chat.id, 'model', msg3_text)
 
 
 async def handle_business_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
