@@ -1,0 +1,33 @@
+# Environment Variables (CRITICAL)
+.env
+.env.*
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual Environments (in case you test locally)
+venv/
+.venv/
+env/
+.env_folder/
+
+# Vercel specific
+.vercel/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE / Editor folders (optional but good practice)
+.vscode/
+.idea/
+*.swp
+*.swo
