@@ -11,13 +11,11 @@ from groq import AsyncGroq
 # --- CONFIGURATION ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-DATABASE_URL = os.getenv("DATABASE_URL")  # Your Neon connection string
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 ai_client = AsyncGroq(api_key=GROQ_API_KEY)
 
 SUDO_ID = 7706888177
-
-# How many hours of silence = a fresh conversation window
 FRESH_WINDOW_HOURS = 3
 
 # --- SYSTEM PROMPT ---
@@ -56,7 +54,6 @@ SYSTEM_PROMPT = (
     "No emojis unless the vibe clearly calls for it. No corporate speak."
 )
 
-# Initialize FastAPI and Telegram App
 app = FastAPI()
 ptb_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
@@ -64,7 +61,6 @@ ptb_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 # --- GROQ HELPER ---
 
 async def groq_chat(messages: list, temperature: float = 0.85) -> str:
-    """Single reusable call to Groq. Messages must be in OpenAI format: [{role, content}]."""
     response = await ai_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=messages,
@@ -75,10 +71,6 @@ async def groq_chat(messages: list, temperature: float = 0.85) -> str:
 
 
 def build_groq_history(db_rows: list) -> list:
-    """
-    Converts raw DB rows into Groq/OpenAI message format.
-    DB roles are 'user' and 'model' — Groq expects 'user' and 'assistant'.
-    """
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for role, content in db_rows:
         groq_role = "assistant" if role == "model" else "user"
@@ -89,7 +81,6 @@ def build_groq_history(db_rows: list) -> list:
 # --- DATABASE LOGIC ---
 
 async def fetch_history(chat_id: int) -> list:
-    """Returns chat history as a Groq-formatted message list."""
     conn = await asyncpg.connect(DATABASE_URL)
     rows = await conn.fetch(
         "SELECT role, content FROM chat_history WHERE user_id = $1 ORDER BY created_at ASC LIMIT 20",
@@ -100,7 +91,6 @@ async def fetch_history(chat_id: int) -> list:
 
 
 async def save_message(chat_id: int, role: str, content: str):
-    """Saves a message to DB. Always store role as 'user' or 'model'."""
     conn = await asyncpg.connect(DATABASE_URL)
     await conn.execute(
         "INSERT INTO chat_history (user_id, role, content) VALUES ($1, $2, $3)",
@@ -111,32 +101,34 @@ async def save_message(chat_id: int, role: str, content: str):
 
 async def get_session_state(chat_id: int):
     """
-    Returns (last_message_at, sudo_replied_since, larry_routine_ran_at).
-    Returns (None, False, None) if no session row exists yet.
+    Returns (last_message_at, sudo_replied_since, larry_routine_ran_at, larry_active).
+    Returns (None, False, None, True) if no session row exists yet.
+    larry_active defaults to True so Larry handles brand new conversations.
     """
     conn = await asyncpg.connect(DATABASE_URL)
     row = await conn.fetchrow(
-        "SELECT last_message_at, sudo_replied_since, larry_routine_ran_at FROM larry_sessions WHERE chat_id = $1",
+        "SELECT last_message_at, sudo_replied_since, larry_routine_ran_at, larry_active FROM larry_sessions WHERE chat_id = $1",
         chat_id
     )
     await conn.close()
     if row:
-        return row['last_message_at'], row['sudo_replied_since'], row['larry_routine_ran_at']
-    return None, False, None
+        return row['last_message_at'], row['sudo_replied_since'], row['larry_routine_ran_at'], row['larry_active']
+    return None, False, None, True  # brand new chat — Larry should handle it
 
 
 async def update_session_after_larry(chat_id: int):
-    """Mark that Larry just ran the routine and update last_message_at."""
+    """Mark that Larry just ran the routine. larry_active = True."""
     now = datetime.now(timezone.utc)
     conn = await asyncpg.connect(DATABASE_URL)
     await conn.execute(
         """
-        INSERT INTO larry_sessions (chat_id, last_message_at, sudo_replied_since, larry_routine_ran_at)
-        VALUES ($1, $2, false, $2)
+        INSERT INTO larry_sessions (chat_id, last_message_at, sudo_replied_since, larry_routine_ran_at, larry_active)
+        VALUES ($1, $2, false, $2, true)
         ON CONFLICT (chat_id) DO UPDATE
             SET last_message_at = $2,
                 sudo_replied_since = false,
-                larry_routine_ran_at = $2
+                larry_routine_ran_at = $2,
+                larry_active = true
         """,
         chat_id, now
     )
@@ -144,13 +136,13 @@ async def update_session_after_larry(chat_id: int):
 
 
 async def update_session_last_message(chat_id: int):
-    """Update last_message_at without resetting anything else."""
+    """Update last_message_at without resetting anything else. larry_active stays as-is."""
     now = datetime.now(timezone.utc)
     conn = await asyncpg.connect(DATABASE_URL)
     await conn.execute(
         """
-        INSERT INTO larry_sessions (chat_id, last_message_at, sudo_replied_since, larry_routine_ran_at)
-        VALUES ($1, $2, false, null)
+        INSERT INTO larry_sessions (chat_id, last_message_at, sudo_replied_since, larry_routine_ran_at, larry_active)
+        VALUES ($1, $2, false, null, true)
         ON CONFLICT (chat_id) DO UPDATE
             SET last_message_at = $2
         """,
@@ -159,15 +151,21 @@ async def update_session_last_message(chat_id: int):
     await conn.close()
 
 
-async def mark_sudo_replied(chat_id: int):
-    """Called when Sudo manually replies — flags next incoming message as a fresh window."""
+async def deactivate_larry(chat_id: int):
+    """
+    Called when Sudo replies. Silences Larry completely for this chat.
+    Also sets sudo_replied_since = true so the NEXT inbound message
+    triggers a fresh window if Sudo doesn't reply again in 3 hours.
+    """
     conn = await asyncpg.connect(DATABASE_URL)
     await conn.execute(
         """
-        INSERT INTO larry_sessions (chat_id, last_message_at, sudo_replied_since, larry_routine_ran_at)
-        VALUES ($1, now(), true, null)
+        INSERT INTO larry_sessions (chat_id, last_message_at, sudo_replied_since, larry_routine_ran_at, larry_active)
+        VALUES ($1, now(), true, null, false)
         ON CONFLICT (chat_id) DO UPDATE
-            SET sudo_replied_since = true
+            SET sudo_replied_since = true,
+                larry_active = false,
+                last_message_at = now()
         """,
         chat_id
     )
@@ -175,7 +173,6 @@ async def mark_sudo_replied(chat_id: int):
 
 
 def is_fresh_window(last_message_at, sudo_replied_since: bool) -> bool:
-    """Returns True if the 3-message routine should run."""
     if sudo_replied_since:
         return True
     if last_message_at is None:
@@ -190,11 +187,7 @@ def is_fresh_window(last_message_at, sudo_replied_since: bool) -> bool:
 # --- BOT LOGIC ---
 
 async def run_checkin_routine(biz_msg, history: list, user_text: str):
-    """
-    Sends the 3-message check-in routine using Groq.
-    history is already in Groq format (with system prompt at index 0).
-    """
-    # --- MESSAGE 1: Sudo is a busy CTO ---
+    # --- MESSAGE 1 ---
     messages_m1 = history + [{
         "role": "user",
         "content": (
@@ -208,10 +201,9 @@ async def run_checkin_routine(biz_msg, history: list, user_text: str):
     await biz_msg.reply_text(msg1_text)
     await save_message(biz_msg.chat.id, 'model', msg1_text)
 
-    # --- DELAY before message 2 ---
     await asyncio.sleep(random.uniform(2.0, 3.0))
 
-    # --- MESSAGE 2: Going to check on Sudo ---
+    # --- MESSAGE 2 ---
     messages_m2 = messages_m1 + [
         {"role": "assistant", "content": msg1_text},
         {
@@ -227,10 +219,9 @@ async def run_checkin_routine(biz_msg, history: list, user_text: str):
     await biz_msg.reply_text(msg2_text)
     await save_message(biz_msg.chat.id, 'model', msg2_text)
 
-    # --- DELAY before message 3 ---
     await asyncio.sleep(random.uniform(3.0, 5.0))
 
-    # --- MESSAGE 3: Status report ---
+    # --- MESSAGE 3 ---
     status_scenarios = [
         "deep in a coding session and completely locked in",
         "in a meeting and cannot step away right now",
@@ -262,22 +253,29 @@ async def handle_business_chat(update: Update, context: ContextTypes.DEFAULT_TYP
     if not biz_msg or not biz_msg.text:
         return
 
-    # If Sudo manually replied, flag it and do nothing else
+    chat_id = biz_msg.chat.id
+
+    # Sudo replied — silence Larry and hand the conversation back
     if biz_msg.from_user.id == SUDO_ID:
-        await mark_sudo_replied(biz_msg.chat.id)
+        await deactivate_larry(chat_id)
         return
 
-    chat_id = biz_msg.chat.id
     user_text = biz_msg.text
 
-    # Save the incoming user message
+    # Pull session state
+    last_message_at, sudo_replied_since, larry_routine_ran_at, larry_active = await get_session_state(chat_id)
+
+    # ✅ THE KEY GATE: if Larry has been deactivated, do nothing
+    if not larry_active:
+        # Still log the message so history stays intact, but don't reply
+        await save_message(chat_id, 'user', user_text)
+        await update_session_last_message(chat_id)
+        return
+
+    # Larry is active — save message and proceed
     await save_message(chat_id, 'user', user_text)
 
-    # Pull session state to decide which mode to run
-    last_message_at, sudo_replied_since, larry_routine_ran_at = await get_session_state(chat_id)
     fresh = is_fresh_window(last_message_at, sudo_replied_since)
-
-    # Rebuild memory in Groq format
     history = await fetch_history(chat_id)
 
     try:
@@ -285,7 +283,6 @@ async def handle_business_chat(update: Update, context: ContextTypes.DEFAULT_TYP
             await run_checkin_routine(biz_msg, history, user_text)
             await update_session_after_larry(chat_id)
         else:
-            # Same session — Larry just responds naturally
             reply_text = await groq_chat(history)
             await save_message(chat_id, 'model', reply_text)
             await biz_msg.reply_text(reply_text)
