@@ -18,6 +18,10 @@ ai_client = AsyncGroq(api_key=GROQ_API_KEY)
 SUDO_ID = 7706888177
 FRESH_WINDOW_HOURS = 3
 
+# How long Larry waits before stepping in (in seconds)
+FIRST_CONTACT_GRACE = 60       # 1 minute — no prior reply from Sudo in this chat
+RE_ENTRY_GRACE = 180           # 3 minutes — Sudo has replied before and gone quiet again
+
 # --- SYSTEM PROMPT ---
 SYSTEM_PROMPT = (
     "You are Larry, the AI chief of staff managing all incoming communications for Sudo — a CTO who moves fast and has no time to spare. "
@@ -101,19 +105,29 @@ async def save_message(chat_id: int, role: str, content: str):
 
 async def get_session_state(chat_id: int):
     """
-    Returns (last_message_at, sudo_replied_since, larry_routine_ran_at, larry_active).
-    Returns (None, False, None, True) if no session row exists yet.
-    larry_active defaults to True so Larry handles brand new conversations.
+    Returns (last_message_at, sudo_replied_since, larry_routine_ran_at, larry_active, sudo_last_replied_at, sudo_has_ever_replied).
+    Returns (None, False, None, True, None, False) if no session row exists yet.
     """
     conn = await asyncpg.connect(DATABASE_URL)
     row = await conn.fetchrow(
-        "SELECT last_message_at, sudo_replied_since, larry_routine_ran_at, larry_active FROM larry_sessions WHERE chat_id = $1",
+        """
+        SELECT last_message_at, sudo_replied_since, larry_routine_ran_at,
+               larry_active, sudo_last_replied_at, sudo_has_ever_replied
+        FROM larry_sessions WHERE chat_id = $1
+        """,
         chat_id
     )
     await conn.close()
     if row:
-        return row['last_message_at'], row['sudo_replied_since'], row['larry_routine_ran_at'], row['larry_active']
-    return None, False, None, True  # brand new chat — Larry should handle it
+        return (
+            row['last_message_at'],
+            row['sudo_replied_since'],
+            row['larry_routine_ran_at'],
+            row['larry_active'],
+            row['sudo_last_replied_at'],
+            row['sudo_has_ever_replied'],
+        )
+    return None, False, None, True, None, False
 
 
 async def update_session_after_larry(chat_id: int):
@@ -122,8 +136,8 @@ async def update_session_after_larry(chat_id: int):
     conn = await asyncpg.connect(DATABASE_URL)
     await conn.execute(
         """
-        INSERT INTO larry_sessions (chat_id, last_message_at, sudo_replied_since, larry_routine_ran_at, larry_active)
-        VALUES ($1, $2, false, $2, true)
+        INSERT INTO larry_sessions (chat_id, last_message_at, sudo_replied_since, larry_routine_ran_at, larry_active, sudo_last_replied_at, sudo_has_ever_replied)
+        VALUES ($1, $2, false, $2, true, null, false)
         ON CONFLICT (chat_id) DO UPDATE
             SET last_message_at = $2,
                 sudo_replied_since = false,
@@ -136,13 +150,13 @@ async def update_session_after_larry(chat_id: int):
 
 
 async def update_session_last_message(chat_id: int):
-    """Update last_message_at without resetting anything else. larry_active stays as-is."""
+    """Update last_message_at without touching anything else."""
     now = datetime.now(timezone.utc)
     conn = await asyncpg.connect(DATABASE_URL)
     await conn.execute(
         """
-        INSERT INTO larry_sessions (chat_id, last_message_at, sudo_replied_since, larry_routine_ran_at, larry_active)
-        VALUES ($1, $2, false, null, true)
+        INSERT INTO larry_sessions (chat_id, last_message_at, sudo_replied_since, larry_routine_ran_at, larry_active, sudo_last_replied_at, sudo_has_ever_replied)
+        VALUES ($1, $2, false, null, true, null, false)
         ON CONFLICT (chat_id) DO UPDATE
             SET last_message_at = $2
         """,
@@ -153,19 +167,35 @@ async def update_session_last_message(chat_id: int):
 
 async def deactivate_larry(chat_id: int):
     """
-    Called when Sudo replies. Silences Larry completely for this chat.
-    Also sets sudo_replied_since = true so the NEXT inbound message
-    triggers a fresh window if Sudo doesn't reply again in 3 hours.
+    Called when Sudo replies. Silences Larry and records the timestamp + marks
+    that Sudo has replied at least once in this chat (flips the grace period to 3 min).
     """
+    now = datetime.now(timezone.utc)
     conn = await asyncpg.connect(DATABASE_URL)
     await conn.execute(
         """
-        INSERT INTO larry_sessions (chat_id, last_message_at, sudo_replied_since, larry_routine_ran_at, larry_active)
-        VALUES ($1, now(), true, null, false)
+        INSERT INTO larry_sessions (chat_id, last_message_at, sudo_replied_since, larry_routine_ran_at, larry_active, sudo_last_replied_at, sudo_has_ever_replied)
+        VALUES ($1, $2, true, null, false, $2, true)
         ON CONFLICT (chat_id) DO UPDATE
             SET sudo_replied_since = true,
                 larry_active = false,
-                last_message_at = now()
+                last_message_at = $2,
+                sudo_last_replied_at = $2,
+                sudo_has_ever_replied = true
+        """,
+        chat_id, now
+    )
+    await conn.close()
+
+
+async def reactivate_larry(chat_id: int):
+    """Flip Larry back on after the grace period expires."""
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute(
+        """
+        UPDATE larry_sessions
+        SET larry_active = true, sudo_replied_since = true
+        WHERE chat_id = $1
         """,
         chat_id
     )
@@ -182,6 +212,25 @@ def is_fresh_window(last_message_at, sudo_replied_since: bool) -> bool:
         last_message_at = last_message_at.replace(tzinfo=timezone.utc)
     hours_elapsed = (now - last_message_at).total_seconds() / 3600
     return hours_elapsed >= FRESH_WINDOW_HOURS
+
+
+def grace_period_expired(sudo_last_replied_at, sudo_has_ever_replied: bool) -> bool:
+    """
+    Returns True if enough time has passed since Sudo last replied
+    that Larry should reactivate.
+    Uses FIRST_CONTACT_GRACE if Sudo has never replied in this chat,
+    RE_ENTRY_GRACE if Sudo has replied before.
+    """
+    grace = RE_ENTRY_GRACE if sudo_has_ever_replied else FIRST_CONTACT_GRACE
+    if sudo_last_replied_at is None:
+        # Sudo never replied — measure from the start (no timestamp to anchor to).
+        # Larry should already be active in this case, but guard anyway.
+        return True
+    now = datetime.now(timezone.utc)
+    if sudo_last_replied_at.tzinfo is None:
+        sudo_last_replied_at = sudo_last_replied_at.replace(tzinfo=timezone.utc)
+    seconds_elapsed = (now - sudo_last_replied_at).total_seconds()
+    return seconds_elapsed >= grace
 
 
 # --- BOT LOGIC ---
@@ -255,22 +304,28 @@ async def handle_business_chat(update: Update, context: ContextTypes.DEFAULT_TYP
 
     chat_id = biz_msg.chat.id
 
-    # Sudo replied — silence Larry and hand the conversation back
+    # Sudo replied — silence Larry and record the timestamp
     if biz_msg.from_user.id == SUDO_ID:
         await deactivate_larry(chat_id)
         return
 
     user_text = biz_msg.text
 
-    # Pull session state
-    last_message_at, sudo_replied_since, larry_routine_ran_at, larry_active = await get_session_state(chat_id)
+    # Pull full session state
+    last_message_at, sudo_replied_since, larry_routine_ran_at, larry_active, sudo_last_replied_at, sudo_has_ever_replied = await get_session_state(chat_id)
 
-    # ✅ THE KEY GATE: if Larry has been deactivated, do nothing
+    # Larry is currently deactivated — check if the grace period has expired
     if not larry_active:
-        # Still log the message so history stays intact, but don't reply
-        await save_message(chat_id, 'user', user_text)
-        await update_session_last_message(chat_id)
-        return
+        if grace_period_expired(sudo_last_replied_at, sudo_has_ever_replied):
+            # Grace period over — Larry reactivates and handles this message
+            await reactivate_larry(chat_id)
+            larry_active = True
+            sudo_replied_since = True   # treat as fresh window so the routine runs
+        else:
+            # Still within grace period — Sudo might still reply, stay silent
+            await save_message(chat_id, 'user', user_text)
+            await update_session_last_message(chat_id)
+            return
 
     # Larry is active — save message and proceed
     await save_message(chat_id, 'user', user_text)
