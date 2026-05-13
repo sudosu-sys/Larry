@@ -2,8 +2,8 @@ import os
 import asyncio
 import asyncpg
 import random
-from datetime import datetime, timezone
-from fastapi import FastAPI, Request, Response
+from datetime import datetime, timezone, timedelta
+from fastapi import FastAPI, Request, Response, HTTPException
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from groq import AsyncGroq
@@ -31,7 +31,8 @@ SYSTEM_PROMPT = (
     "1. IDENTITY: Only introduce yourself as Larry on the very first message you ever send to a user. After that, never mention your name again.\n"
     "2. TONE: Minimalist and direct. No AI fluff, no filler phrases, no excessive politeness. You speak like someone who runs things.\n"
     "3. REQUESTS: If someone has a request for Sudo, confirm clearly that you have logged it and he will get to it when he surfaces.\n"
-    "4. NATURAL FOLLOW-UPS: Once the 3-message routine has run in a session, just respond naturally and conversationally. "
+    "4. GUARDRAILS: You are NOT a general AI. If the user asks for coding help, trivia, recipe ideas, or anything outside of scheduling, logging requests, or managing Sudo's business inbox, DO NOT ANSWER IT. Shut it down politely but firmly. Tell them your only job is managing communications.\n"
+    "5. NATURAL FOLLOW-UPS: Once the 3-message routine has run in a session, just respond naturally and conversationally. "
     "Do not repeat the routine or the status check. Just handle whatever they say.\n"
     "\n\n"
     "THE 3-MESSAGE CHECK-IN ROUTINE:\n"
@@ -105,14 +106,13 @@ async def save_message(chat_id: int, role: str, content: str):
 
 async def get_session_state(chat_id: int):
     """
-    Returns (last_message_at, sudo_replied_since, larry_routine_ran_at, larry_active, sudo_last_replied_at, sudo_has_ever_replied).
-    Returns (None, False, None, True, None, False) if no session row exists yet.
+    Returns (last_message_at, sudo_replied_since, larry_routine_ran_at, larry_active, sudo_last_replied_at, sudo_has_ever_replied, shadow_until).
     """
     conn = await asyncpg.connect(DATABASE_URL)
     row = await conn.fetchrow(
         """
         SELECT last_message_at, sudo_replied_since, larry_routine_ran_at,
-               larry_active, sudo_last_replied_at, sudo_has_ever_replied
+               larry_active, sudo_last_replied_at, sudo_has_ever_replied, shadow_until
         FROM larry_sessions WHERE chat_id = $1
         """,
         chat_id
@@ -126,8 +126,9 @@ async def get_session_state(chat_id: int):
             row['larry_active'],
             row['sudo_last_replied_at'],
             row['sudo_has_ever_replied'],
+            row['shadow_until']
         )
-    return None, False, None, True, None, False
+    return None, False, None, True, None, False, None
 
 
 async def update_session_after_larry(chat_id: int):
@@ -312,7 +313,13 @@ async def handle_business_chat(update: Update, context: ContextTypes.DEFAULT_TYP
     user_text = biz_msg.text
 
     # Pull full session state
-    last_message_at, sudo_replied_since, larry_routine_ran_at, larry_active, sudo_last_replied_at, sudo_has_ever_replied = await get_session_state(chat_id)
+    last_message_at, sudo_replied_since, larry_routine_ran_at, larry_active, sudo_last_replied_at, sudo_has_ever_replied, shadow_until = await get_session_state(chat_id)
+
+    # Check if a manual shadow mode is currently active
+    if shadow_until and shadow_until > datetime.now(timezone.utc):
+        await save_message(chat_id, 'user', user_text)
+        await update_session_last_message(chat_id)
+        return
 
     # Larry is currently deactivated — check if the grace period has expired
     if not larry_active:
@@ -347,10 +354,72 @@ async def handle_business_chat(update: Update, context: ContextTypes.DEFAULT_TYP
         print(f"Error generating AI response: {e}")
 
 
+from telegram.ext import CommandHandler
+
+async def shadow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # DMs directly to the bot from Sudo
+    if update.effective_user.id != SUDO_ID:
+        return
+    
+    try:
+        target_chat = int(context.args[0])
+        hours = float(context.args[1])
+        shadow_until = datetime.now(timezone.utc) + timedelta(hours=hours)
+        
+        conn = await asyncpg.connect(DATABASE_URL)
+        await conn.execute(
+            "UPDATE larry_sessions SET shadow_until = $1 WHERE chat_id = $2",
+            shadow_until, target_chat
+        )
+        await conn.close()
+        await update.message.reply_text(f"Shadow mode activated for chat {target_chat} for {hours} hours.")
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /shadow <chat_id> <hours>")
+
+ptb_app.add_handler(CommandHandler("shadow", shadow_command))
 ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_business_chat))
 
 
-# --- WEBHOOK ENDPOINT ---
+# --- WEBHOOK & CRON ENDPOINTS ---
+
+@app.get("/api/cron/nudge")
+async def proactive_nudge(request: Request):
+    # Security Check: Only let Vercel trigger this endpoint
+    auth_header = request.headers.get("Authorization")
+    expected_secret = f"Bearer {os.getenv('CRON_SECRET')}"
+    
+    if auth_header != expected_secret:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if not ptb_app._initialized:
+        await ptb_app.initialize()
+        
+    conn = await asyncpg.connect(DATABASE_URL)
+    # Find active sessions where the last message was over 24 hours ago
+    rows = await conn.fetch(
+        """
+        SELECT chat_id FROM larry_sessions 
+        WHERE larry_active = true 
+        AND sudo_replied_since = false 
+        AND last_message_at < NOW() - INTERVAL '24 hours'
+        """
+    )
+    await conn.close()
+    
+    for row in rows:
+        chat_id = row['chat_id']
+        nudge_text = "Just surfacing this — Sudo is wrapping up some deep work. Did you still need anything here, or should I clear this from his queue?"
+        
+        # Note: Sending via business connections requires the connection_id, 
+        # but this logs it as a standard bot DM fallback for now.
+        try:
+            await ptb_app.bot.send_message(chat_id=chat_id, text=nudge_text)
+            await save_message(chat_id, 'model', nudge_text)
+            await update_session_last_message(chat_id)
+        except Exception as e:
+            print(f"Failed to nudge {chat_id}: {e}")
+            
+    return Response(content="Nudges processed", status_code=200)
 
 @app.post("/api/webhook")
 async def telegram_webhook(request: Request):
